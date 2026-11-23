@@ -45,6 +45,9 @@
     box-shadow: 0 6px 0 var(--accent-dark); touch-action: manipulation;
   }
   button:active { transform: translateY(3px); box-shadow: 0 3px 0 var(--accent-dark); }
+  button.secondary { background: #f5c542; color: #3a2b00; box-shadow: 0 6px 0 #c99a1f; font-size: 17px; }
+  button.secondary:active { box-shadow: 0 3px 0 #c99a1f; }
+  p.small { font-size: 13px; }
 </style>
 </head>
 <body>
@@ -59,6 +62,7 @@
     <div class="rule"><canvas data-icon="used" width="68" height="68"></canvas>использованный — не ловите, минус жизнь</div>
   </div>
   <p>Пропустили 3 целых стика — игра окончена.</p>
+  <p class="tg-only hidden">🏆 После игры лучший результат можно записать в общий рейтинг команды.</p>
   <button id="startBtn">Играть</button>
 </div>
 
@@ -67,6 +71,8 @@
   <div class="big" id="finalScore">0</div>
   <p id="bestLine">Лучший результат: 0</p>
   <button id="againBtn">Ещё раз</button>
+  <button id="saveBtn" class="secondary tg-only hidden">🏆 Записать в рейтинг</button>
+  <p id="saveHint" class="small tg-only hidden"></p>
 </div>
 
 <script>
@@ -87,6 +93,9 @@
   const haptic = (type) => {
     try { tg && tg.HapticFeedback && tg.HapticFeedback.impactOccurred(type); } catch (e) {}
   };
+  // Рейтинг: игра открыта в Telegram кнопкой «🎮 Игра» — результат можно отправить боту
+  const inTelegram = !!(tg && tg.platform && tg.platform !== "unknown" && typeof tg.sendData === "function");
+  if (inTelegram) document.querySelectorAll(".tg-only").forEach((el) => el.classList.remove("hidden"));
 
   // ---------- рекорд (только на этом устройстве) ----------
   const BEST_KEY = "catch-sticks-best";
@@ -285,14 +294,37 @@
     running = true;
   }
 
+  // лучший результат за этот запуск игры — его и записываем в рейтинг
+  let sessionBest = 0, sessionBestSecs = 0, gamesPlayed = 0;
+
   function gameOver() {
     running = false;
     haptic("heavy");
+    gamesPlayed += 1;
+    if (score > sessionBest) { sessionBest = score; sessionBestSecs = elapsed; }
     if (score > best) { best = score; saveBest(best); }
     document.getElementById("finalScore").textContent = score;
     document.getElementById("bestLine").textContent =
       score >= best && score > 0 ? "🎉 Новый рекорд!" : `Лучший результат: ${best}`;
+    if (inTelegram) {
+      const btn = document.getElementById("saveBtn");
+      btn.textContent = sessionBest > 0 ? `🏆 Записать в рейтинг: ${sessionBest}` : "🏆 Записать в рейтинг";
+      btn.disabled = sessionBest <= 0;
+      document.getElementById("saveHint").textContent = sessionBest > 0
+        ? "Запишется лучший результат этой серии игр. Игра закроется, ответ придёт в чат."
+        : "Поймайте хотя бы один стик, чтобы попасть в рейтинг.";
+    }
     document.getElementById("over").classList.remove("hidden");
+  }
+
+  function sendScore() {
+    if (!inTelegram || sessionBest <= 0) return;
+    try {
+      tg.sendData(JSON.stringify({ v: 1, best: sessionBest, secs: Math.round(sessionBestSecs), games: gamesPlayed }));
+    } catch (e) { // например, игру открыли не кнопкой внизу чата
+      document.getElementById("saveHint").textContent =
+        "Не получилось отправить. Откройте игру кнопкой «🎮 Игра» внизу чата с ботом.";
+    }
   }
 
   // ---------- управление ----------
@@ -423,6 +455,7 @@
   } catch (e) {}
   document.getElementById("startBtn").addEventListener("click", start);
   document.getElementById("againBtn").addEventListener("click", start);
+  document.getElementById("saveBtn").addEventListener("click", sendScore);
 
   makeStars();
   resize();
