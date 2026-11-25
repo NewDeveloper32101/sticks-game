@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Прыг по стикам!</title>
+<!-- Telegram Mini App: разворачиваем на весь экран, вибрация при прыжках -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg-top: #0f1f2e;
+    --accent: #2fb5a8;
+    --accent-dark: #1d8278;
+    --text: #f3f7f9;
+    --muted: #a9bcc8;
+    --gold: #f5c542;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%; overflow: hidden; background: var(--bg-top); color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    overscroll-behavior: none; touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; -webkit-text-size-adjust: 100%;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+  .overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; text-align: center;
+    padding: calc(24px + env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom));
+    background: rgba(10, 22, 33, 0.72); backdrop-filter: blur(3px);
+  }
+  .hidden { display: none; }
+  h1 { font-size: 32px; letter-spacing: .5px; }
+  .big { font-size: 56px; font-weight: 800; color: var(--gold); line-height: 1; }
+  p { color: var(--muted); font-size: 16px; line-height: 1.45; max-width: 320px; }
+  .rules { display: grid; gap: 10px; margin: 6px 0 4px; text-align: left; }
+  .rule { display: flex; align-items: center; gap: 12px; font-size: 15px; color: var(--text); }
+  .rule canvas { width: 48px; height: 24px; flex: none; }
+  button {
+    margin-top: 8px; padding: 15px 36px; border: 0; border-radius: 14px; cursor: pointer;
+    background: var(--accent); color: #fff; font-size: 19px; font-weight: 700;
+    box-shadow: 0 6px 0 var(--accent-dark); touch-action: manipulation;
+  }
+  button:active { transform: translateY(3px); box-shadow: 0 3px 0 var(--accent-dark); }
+  button.secondary { background: #f5c542; color: #3a2b00; box-shadow: 0 6px 0 #c99a1f; font-size: 17px; }
+  button.secondary:active { box-shadow: 0 3px 0 #c99a1f; }
+  p.small { font-size: 13px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="start" class="overlay">
+  <h1>Прыг по стикам!</h1>
+  <p>Прыгайте по стикам всё выше и выше. Ведите пальцем влево-вправо в любом месте экрана, чтобы управлять героем. Если уйти за край экрана, герой выйдет с другой стороны.</p>
+  <div class="rules">
+    <div class="rule"><canvas data-icon="stick" width="96" height="48"></canvas>стик: обычный прыжок</div>
+    <div class="rule"><canvas data-icon="gold" width="96" height="48"></canvas>золотой стик: суперпрыжок</div>
+    <div class="rule"><canvas data-icon="used" width="96" height="48"></canvas>использованный: ломается, не держит</div>
+  </div>
+  <p>Если упасть вниз, игра окончена.</p>
+  <p class="tg-only hidden">🏆 После игры лучший результат можно записать в общий рейтинг команды.</p>
+  <button id="startBtn">Играть</button>
+</div>
+
+<div id="over" class="overlay hidden">
+  <h1>Игра окончена</h1>
+  <div class="big" id="finalScore">0</div>
+  <p id="bestLine">Лучший результат: 0</p>
+  <button id="againBtn">Ещё раз</button>
+  <button id="saveBtn" class="secondary tg-only hidden">🏆 Записать в рейтинг</button>
+  <p id="saveHint" class="small tg-only hidden"></p>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ---------- Telegram ----------
+  const tg = window.Telegram && window.Telegram.WebApp;
+  try {
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      if (tg.disableVerticalSwipes) tg.disableVerticalSwipes();
+      if (tg.setHeaderColor) tg.setHeaderColor("#0f1f2e");
+      if (tg.setBackgroundColor) tg.setBackgroundColor("#0f1f2e");
+    }
+  } catch (e) {}
+  const haptic = (type) => { try { tg && tg.HapticFeedback && tg.HapticFeedback.impactOccurred(type); } catch (e) {} };
+  const inTelegram = !!(tg && tg.platform && tg.platform !== "unknown" && typeof tg.sendData === "function");
+  if (inTelegram) document.querySelectorAll(".tg-only").forEach((el) => el.classList.remove("hidden"));
+
+  const BEST_KEY = "jump-sticks-best";
+  const loadBest = () => { try { return +localStorage.getItem(BEST_KEY) || 0; } catch (e) { return 0; } };
+  const saveBest = (v) => { try { localStorage.setItem(BEST_KEY, String(v)); } catch (e) {} };
+
+  // ---------- мир ----------
+  // Игра считается в «мировых» единицах: ширина поля всегда 400. Так прыжки одинаковые
+  // на любом телефоне и на компьютере — и рейтинг честный.
+  const WW = 400;
+  const GRAVITY = 1500, JUMP_V = 800, SUPER_V = 1350; // высота прыжка ≈ 213, суперпрыжка ≈ 607
+  const MAX_GAP = 165;                                  // всегда меньше высоты обычного прыжка
+  const UNITS_PER_POINT = 10;                           // 1 очко = 10 единиц высоты
+  const STICK_W = 74, STICK_H = 14;
+  const HERO_W = 42, HERO_H = 46;
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  let W = 0, H = 0, DPR = 1, S = 1, OX = 0, VH = 640;
+  const inset = { top: 0, bottom: 0 };
+
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;visibility:hidden;pointer-events:none;" +
+    "padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)";
+  document.body.appendChild(probe);
+  function readInsets() {
+    const cs = getComputedStyle(probe);
+    let top = parseFloat(cs.paddingTop) || 0, bottom = parseFloat(cs.paddingBottom) || 0;
+    try {
+      for (const s of [tg && tg.safeAreaInset, tg && tg.contentSafeAreaInset]) {
+        if (s) { top = Math.max(top, s.top || 0); bottom = Math.max(bottom, s.bottom || 0); }
+      }
+    } catch (e) {}
+    inset.top = top; inset.bottom = bottom;
+  }
+
+  function resize() {
+    readInsets();
+    DPR = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    S = Math.min(W / WW, H / 620);   // на широком экране поле — колонка по центру
+    OX = (W - WW * S) / 2;
+    VH = H / S;                       // сколько мира видно по высоте
+  }
+  const sx = (x) => OX + (((x % WW) + WW) % WW) * S;
+  const sy = (y) => H - (y - camY) * S;
+
+  // ---------- рисование ----------
+  function roundRect(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+  }
+
+  // горизонтальный стик (без логотипов): белый корпус, справа фильтр с полоской
+  function drawStick(c, x, y, k, kind, crack) {
+    const L = STICK_W * k, T = STICK_H * k;
+    c.save(); c.translate(x, y);
+    if (kind === "used") {
+      // потемневший, согнутый посередине, с обгоревшим концом
+      const half = L / 2;
+      c.shadowColor = "rgba(0,0,0,.4)"; c.shadowBlur = 5 * k; c.shadowOffsetY = 2 * k;
+      c.save(); c.translate(0, crack * 6 * k); c.rotate(0.12 + crack * 0.5);
+      roundRect(c, 0, -T / 2, half, T, T / 2); c.fillStyle = "#9d8b6c"; c.fill();
+      c.restore();
+      c.save(); c.translate(0, crack * 6 * k); c.rotate(-0.12 - crack * 0.5);
+      roundRect(c, -half, -T / 2, half + T / 2, T, T / 2);
+      const g = c.createLinearGradient(-half, 0, 0, 0);
+      g.addColorStop(0, "#14100d"); g.addColorStop(0.3, "#3d2f25"); g.addColorStop(1, "#8e8070");
+      c.fillStyle = g; c.fill();
+      c.shadowColor = "transparent";
+      c.fillStyle = "#e0662f";
+      c.beginPath(); c.arc(-half + 3 * k, 0, 1.8 * k, 0, Math.PI * 2); c.fill();
+      c.restore();
+      c.restore();
+      return;
+    }
+    const gold = kind === "gold";
+    c.shadowColor = gold ? "rgba(245,197,66,.7)" : "rgba(0,0,0,.35)";
+    c.shadowBlur = gold ? 14 * k : 6 * k; c.shadowOffsetY = gold ? 0 : 2 * k;
+    roundRect(c, -L / 2, -T / 2, L, T, T / 2);
+    c.fillStyle = gold ? "#f5c542" : "#f7f7f2"; c.fill();
+    c.shadowColor = "transparent";
+    c.save(); c.clip();
+    c.fillStyle = gold ? "#e0a826" : "#d9c6a5";
+    c.fillRect(L / 2 - L * 0.34, -T / 2, L * 0.34, T);
+    c.fillStyle = gold ? "#fff3c4" : "#2fb5a8";
+    c.fillRect(L / 2 - L * 0.34 - 2.6 * k, -T / 2, 2.6 * k, T);
+    c.fillStyle = "rgba(255,255,255,.4)";
+    c.fillRect(-L / 2 + 4 * k, -T / 2 + 2 * k, L * 0.45, 2.2 * k);
+    c.restore();
+    if (gold) {
+      c.fillStyle = "#fff";
+      for (const [px, py] of [[-24, -11], [6, -12], [26, 10]]) {
+        c.beginPath(); c.arc(px * k, py * k, 1.5 * k, 0, Math.PI * 2); c.fill();
+      }
+    }
+    c.restore();
+  }
+
+  // герой — круглый бирюзовый прыгун с глазами; squash — сплющивание при отскоке
+  function drawHero(c, x, y, k, face, squash, flying) {
+    const w = HERO_W * k * (1 + squash * 0.18), h = HERO_H * k * (1 - squash * 0.2);
+    c.save(); c.translate(x, y);
+    // ножки
+    c.strokeStyle = "#1d8278"; c.lineWidth = 4 * k; c.lineCap = "round";
+    const legY = flying ? -2 * k : 0;
+    for (const lx of [-9, 9]) {
+      c.beginPath(); c.moveTo(lx * k, -8 * k); c.lineTo(lx * k + (flying ? lx * 0.2 * k : 0), legY); c.stroke();
+    }
+    // тело
+    c.shadowColor = "rgba(0,0,0,.35)"; c.shadowBlur = 8 * k; c.shadowOffsetY = 3 * k;
+    const g = c.createLinearGradient(-w / 2, -h, w / 2, 0);
+    g.addColorStop(0, "#5fd8cc"); g.addColorStop(1, "#23948a");
+    c.fillStyle = g;
+    c.beginPath(); c.ellipse(0, -h / 2 - 4 * k, w / 2, h / 2, 0, 0, Math.PI * 2); c.fill();
+    c.shadowColor = "transparent";
+    // белая полоса
+    c.save(); c.clip();
+    c.fillStyle = "rgba(255,255,255,.9)"; c.fillRect(-w / 2, -h * 0.32 - 4 * k, w, h * 0.13);
+    c.restore();
+    // глаза смотрят туда, куда летим
+    const ex = face * 4 * k, ey = -h * 0.66 - 4 * k;
+    for (const dx of [-8, 8]) {
+      c.fillStyle = "#fff"; c.beginPath(); c.arc(dx * k + ex * 0.4, ey, 6 * k, 0, Math.PI * 2); c.fill();
+      c.fillStyle = "#0f1f2e"; c.beginPath(); c.arc(dx * k + ex, ey + 1 * k, 3 * k, 0, Math.PI * 2); c.fill();
+    }
+    c.restore();
+  }
+
+  document.querySelectorAll("canvas[data-icon]").forEach((cv) => {
+    const c = cv.getContext("2d"); c.scale(2, 2);
+    drawStick(c, 24, 12, 0.56, cv.dataset.icon, 0);
+  });
+
+  // ---------- состояние ----------
+  let hero, sticks, popups, stars, camY, topY, maxY, score, best = loadBest();
+  let running = false, elapsed = 0, lastT = 0, targetX = null;
+
+  function makeStars() {
+    stars = Array.from({ length: 60 }, () => ({ x: Math.random(), y: Math.random(), r: Math.random() * 1.3 + 0.3,
+                                                a: Math.random() * 0.5 + 0.2, d: Math.random() * 0.3 + 0.05 }));
+  }
+
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const difficulty = () => Math.min(1, topY / 15000); // 0 → 1 к ~1500 очкам
+
+  function addStick(y, kind, moving) {
+    const s = { x: rand(STICK_W / 2 + 4, WW - STICK_W / 2 - 4), y, kind, crack: 0, falling: false, vy: 0,
+                vx: moving ? rand(50, 70 + 90 * difficulty()) * (Math.random() < 0.5 ? -1 : 1) : 0 };
+    sticks.push(s);
+    stats.spawned[kind] += 1;
+    return s;
+  }
+
+  // генерируем стики вверх: опорные — всегда в пределах прыжка, использованные — только «ловушки» между ними
+  function generate() {
+    while (topY < camY + VH + 250) {
+      const d = difficulty();
+      const gap = Math.min(MAX_GAP, rand(48 + 60 * d, 90 + 75 * d));
+      const r = Math.random();
+      const kind = r < 0.055 ? "gold" : "stick";
+      const moving = kind === "stick" && topY > 1500 && Math.random() < 0.12 + 0.3 * d;
+      const prevY = topY;
+      topY += gap;
+      addStick(topY, kind, moving);
+      if (topY > 2500 && gap > 85 && Math.random() < 0.12 + 0.3 * d) addStick(prevY + gap * rand(0.4, 0.6), "used", false);
+    }
+  }
+
+  function popup(text, x, y, color) { popups.push({ text, x, y, color, t: 0 }); }
+
+  const pageOpenedAt = Date.now();
+  function newStats() {
+    return { bounces: 0, supers: 0, broke: 0, spawned: { stick: 0, gold: 0, used: 0 },
+             inputs: { touch: 0, drag: 0, mouse: 0, key: 0 }, startedAt: Date.now() };
+  }
+  let stats = newStats();
+  let sessionBest = 0, sessionBestSecs = 0, gamesPlayed = 0, sessionGames = [], bestGameDetail = null;
+
+  function reset() {
+    stats = newStats();
+    sticks = []; popups = []; camY = -120; topY = 0; maxY = 0; score = 0; elapsed = 0;
+    hero = { x: WW / 2, y: 0, vx: 0, vy: JUMP_V, face: 1, squash: 0 };
+    targetX = null;
+    sticks.push({ x: WW / 2, y: 0, kind: "stick", crack: 0, falling: false, vy: 0, vx: 0 });
+    generate();
+  }
+
+  function start() {
+    reset();
+    document.getElementById("start").classList.add("hidden");
+    document.getElementById("over").classList.add("hidden");
+    running = true;
+  }
+
+  function gameOver() {
+    running = false;
+    haptic("heavy");
+    gamesPlayed += 1;
+    const detail = { score, secs: Math.round(elapsed * 10) / 10, bounces: stats.bounces, supers: stats.supers,
+                     broke: stats.broke, spawned: stats.spawned, inputs: stats.inputs,
+                     startedAt: stats.startedAt, endedAt: Date.now() };
+    sessionGames.push({ s: score, t: Math.round(elapsed) });
+    if (sessionGames.length > 30) sessionGames.shift();
+    if (score > sessionBest) { sessionBest = score; sessionBestSecs = elapsed; bestGameDetail = detail; }
+    const record = score > best;
+    if (record) { best = score; saveBest(best); }
+    document.getElementById("finalScore").textContent = score;
+    document.getElementById("bestLine").textContent = record ? "🎉 Новый рекорд!" : `Лучший результат: ${best}`;
+    if (inTelegram) {
+      const btn = document.getElementById("saveBtn");
+      btn.textContent = sessionBest > 0 ? `🏆 Записать в рейтинг: ${sessionBest}` : "🏆 Записать в рейтинг";
+      btn.disabled = sessionBest <= 0;
+      document.getElementById("saveHint").textContent = sessionBest > 0
+        ? "Запишется лучший результат этой серии игр. Игра закроется, ответ придёт в чат."
+        : "Подпрыгните хоть немного, чтобы попасть в рейтинг.";
+    }
+    document.getElementById("over").classList.remove("hidden");
+  }
+
+  function sendScore() {
+    if (!inTelegram || sessionBest <= 0) return;
+    try {
+      const payload = {
+        game: "jump", v: 1, best: sessionBest, secs: Math.round(sessionBestSecs), games: gamesPlayed,
+        detail: bestGameDetail, session: sessionGames,
+        device: { platform: tg.platform, version: tg.version, w: W, h: H, dpr: DPR,
+                  ua: (navigator.userAgent || "").slice(0, 160) },
+        openSecs: Math.round((Date.now() - pageOpenedAt) / 1000),
+      };
+      let data = JSON.stringify(payload);
+      if (data.length > 4000) { payload.session = sessionGames.slice(-5); payload.device.ua = ""; data = JSON.stringify(payload); }
+      tg.sendData(data);
+    } catch (e) {
+      document.getElementById("saveHint").textContent =
+        "Не получилось отправить. Откройте игру кнопкой внизу чата с ботом.";
+    }
+  }
+
+  // ---------- управление ----------
+  // Палец: ведём в любом месте экрана, герой повторяет движение. Мышь: герой идёт к курсору.
+  let drag = null;
+  canvas.addEventListener("pointerdown", (e) => {
+    if (running) stats.inputs[e.pointerType === "mouse" ? "mouse" : "touch"] += 1;
+    if (e.pointerType === "mouse") { mouseTo(e.clientX); return; }
+    if (!hero) return;
+    drag = { id: e.pointerId, startX: e.clientX, heroX: hero.x };
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (running) stats.inputs[e.pointerType === "mouse" ? "mouse" : "drag"] += 1;
+    if (e.pointerType === "mouse") { mouseTo(e.clientX); return; }
+    if (drag && e.pointerId === drag.id) targetX = drag.heroX + ((e.clientX - drag.startX) / S) * 1.3;
+  });
+  const endDrag = (e) => { if (drag && e.pointerId === drag.id) { drag = null; targetX = null; } };
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") targetX = null; });
+  function mouseTo(clientX) {
+    if (!hero) return;
+    const mx = (clientX - OX) / S;
+    targetX = mx + WW * Math.round((hero.x - mx) / WW); // ближайшая «копия» точки с учётом выхода за край
+  }
+  const keys = new Set();
+  const LEFT = ["ArrowLeft", "a", "A", "ф", "Ф"], RIGHT = ["ArrowRight", "d", "D", "в", "В"];
+  window.addEventListener("keydown", (e) => {
+    if (LEFT.includes(e.key) || RIGHT.includes(e.key)) {
+      if (running && !e.repeat) stats.inputs.key += 1;
+      keys.add(e.key); e.preventDefault();
+    }
+    if ((e.key === " " || e.key === "Enter") && !running) start();
+  });
+  window.addEventListener("keyup", (e) => keys.delete(e.key));
+
+  // ---------- цикл ----------
+  const MAX_VX = 560;
+  function update(dt) {
+    elapsed += dt;
+    // горизонталь
+    const left = LEFT.some((k) => keys.has(k)), right = RIGHT.some((k) => keys.has(k));
+    if (left || right) { hero.vx = (right ? 1 : -1) * 420; targetX = null; }
+    else if (targetX !== null) hero.vx = Math.max(-MAX_VX, Math.min(MAX_VX, (targetX - hero.x) * 12));
+    else hero.vx *= Math.max(0, 1 - dt * 10);
+    hero.x += hero.vx * dt;
+    if (Math.abs(hero.vx) > 20) hero.face = hero.vx > 0 ? 1 : -1;
+    // если герой ушёл за край — переносим и его, и цель (рисуется всё равно по модулю)
+    if (hero.x < 0 || hero.x >= WW) {
+      const shift = hero.x < 0 ? WW : -WW;
+      hero.x += shift; if (targetX !== null) targetX += shift; if (drag) drag.heroX += shift;
+    }
+    // вертикаль
+    const prevY = hero.y;
+    hero.vy -= GRAVITY * dt;
+    hero.y += hero.vy * dt;
+    hero.squash = Math.max(0, hero.squash - dt * 5);
+
+    // стики
+    for (const s of sticks) {
+      if (s.vx) {
+        s.x += s.vx * dt;
+        if (s.x < STICK_W / 2 || s.x > WW - STICK_W / 2) { s.vx = -s.vx; s.x = Math.max(STICK_W / 2, Math.min(WW - STICK_W / 2, s.x)); }
+      }
+      if (s.falling) { s.vy -= GRAVITY * dt; s.y += s.vy * dt; s.crack = Math.min(1, s.crack + dt * 4); }
+    }
+    // приземление — только когда падаем и ноги пересекли верх стика
+    if (hero.vy < 0) {
+      for (const s of sticks) {
+        if (s.falling) continue;
+        const top = s.y + STICK_H / 2;
+        if (prevY >= top && hero.y <= top && Math.abs(hero.x - s.x) <= STICK_W / 2 + HERO_W * 0.3) {
+          if (s.kind === "used") {
+            s.falling = true; stats.broke += 1; haptic("rigid");
+            popup("хрусть!", s.x, s.y + 30, "#ff9b9b");
+            continue; // не держит — летим дальше
+          }
+          hero.y = top;
+          hero.vy = s.kind === "gold" ? SUPER_V : JUMP_V;
+          hero.squash = 1;
+          stats.bounces += 1;
+          if (s.kind === "gold") { stats.supers += 1; haptic("medium"); popup("супер!", s.x, s.y + 40, "#f5c542"); }
+          else haptic("light");
+          break;
+        }
+      }
+    }
+
+    // камера едет только вверх
+    if (hero.y - camY > VH * 0.55) camY = hero.y - VH * 0.55;
+    maxY = Math.max(maxY, hero.y);
+    score = Math.floor(maxY / UNITS_PER_POINT);
+    generate();
+    sticks = sticks.filter((s) => s.y > camY - 120);
+    for (const p of popups) p.t += dt;
+    popups = popups.filter((p) => p.t < 0.9);
+
+    if (hero.y < camY - HERO_H) gameOver();
+  }
+
+  function render() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#0f1f2e"); g.addColorStop(1, "#1f4256");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    // звёзды с параллаксом
+    for (const s of stars) {
+      const y = ((s.y * H + camY * S * s.d) % H + H) % H;
+      ctx.globalAlpha = s.a; ctx.fillStyle = "#fff";
+      ctx.beginPath(); ctx.arc(s.x * W, y, s.r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    if (!hero) return;
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(OX, 0, WW * S, H); ctx.clip();
+    if (OX > 0) { ctx.fillStyle = "rgba(255,255,255,.03)"; ctx.fillRect(OX, 0, WW * S, H); }
+
+    // отметки высоты каждые 100 очков и линия личного рекорда
+    ctx.font = `600 ${Math.round(12 * S)}px -apple-system, Segoe UI, Roboto, Arial`;
+    const step = 100 * UNITS_PER_POINT;
+    for (let y = Math.ceil(camY / step) * step; y < camY + VH; y += step) {
+      if (y <= 0) continue;
+      ctx.fillStyle = "rgba(255,255,255,.07)"; ctx.fillRect(OX, sy(y), WW * S, 1);
+      ctx.fillStyle = "rgba(255,255,255,.25)"; ctx.textAlign = "left";
+      ctx.fillText(String(y / UNITS_PER_POINT), OX + 6, sy(y) - 4);
+    }
+    if (best > 0) {
+      const by = best * UNITS_PER_POINT;
+      if (by > camY && by < camY + VH) {
+        ctx.setLineDash([8, 6]); ctx.strokeStyle = "rgba(245,197,66,.7)"; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(OX, sy(by)); ctx.lineTo(OX + WW * S, sy(by)); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = "#f5c542"; ctx.textAlign = "right";
+        ctx.fillText(`рекорд ${best}`, OX + WW * S - 6, sy(by) - 5);
+      }
+    }
+
+    for (const s of sticks) {
+      const x = sx(s.x), y = sy(s.y);
+      if (y < -40 || y > H + 40) continue;
+      drawStick(ctx, x, y, S, s.kind, s.crack);
+    }
+
+    // герой (у края экрана рисуем и «вторую половину» с другой стороны)
+    const hx = sx(hero.x), hy = sy(hero.y);
+    for (const off of [0, -WW * S, WW * S]) {
+      if (off && Math.abs(hx + off - (OX + WW * S / 2)) > WW * S / 2 + HERO_W * S) continue;
+      drawHero(ctx, hx + off, hy, S, hero.face, hero.squash, hero.vy > 0);
+    }
+
+    for (const p of popups) {
+      ctx.globalAlpha = 1 - p.t / 0.9;
+      ctx.fillStyle = p.color; ctx.font = `800 ${Math.round(20 * S)}px -apple-system, Segoe UI, Roboto, Arial`;
+      ctx.textAlign = "center"; ctx.fillText(p.text, sx(p.x), sy(p.y) - p.t * 50);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // счёт — ниже «чёлки»
+    const top = inset.top + 18;
+    ctx.textAlign = "left"; ctx.fillStyle = "#fff";
+    ctx.font = "800 30px -apple-system, Segoe UI, Roboto, Arial";
+    ctx.fillText(score, 18, top + 24);
+    ctx.font = "600 13px -apple-system, Segoe UI, Roboto, Arial"; ctx.fillStyle = "#a9bcc8";
+    ctx.fillText(`рекорд ${Math.max(best, score)}`, 18, top + 44);
+  }
+
+  function frame(t) {
+    const dt = Math.min(0.033, (t - lastT) / 1000 || 0); // мелкий шаг — чтобы не «проскакивать» сквозь стики
+    lastT = t;
+    if (running) update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+
+  document.addEventListener("visibilitychange", () => { lastT = performance.now(); });
+  window.addEventListener("resize", resize);
+  try {
+    if (tg && tg.onEvent) for (const ev of ["viewportChanged", "safeAreaChanged", "contentSafeAreaChanged"]) tg.onEvent(ev, resize);
+  } catch (e) {}
+  document.getElementById("startBtn").addEventListener("click", start);
+  document.getElementById("againBtn").addEventListener("click", start);
+  document.getElementById("saveBtn").addEventListener("click", sendScore);
+
+  makeStars();
+  resize();
+  reset(); // фон за меню — стартовая сцена
+  requestAnimationFrame((t) => { lastT = t; frame(t); });
+
+  window.__game = { get state() { return { running, score, best, y: hero.y, vy: hero.vy, camY, sticks: sticks.length }; },
+                    start, hero: () => hero, sticks: () => sticks };
+})();
+</script>
+</body>
+</html>
