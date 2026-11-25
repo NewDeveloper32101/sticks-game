@@ -276,6 +276,7 @@
   function spawn() {
     const r = Math.random();
     const type = r < 0.08 ? "gold" : r < (elapsed > 12 ? 0.22 : 0.12) ? "used" : "stick";
+    stats.spawned[type] += 1; // только счётчик для анализа — на игру не влияет
     const margin = 24;
     items.push({
       type, x: margin + Math.random() * (W - margin * 2), y: -40,
@@ -288,6 +289,7 @@
 
   function start() {
     items = []; popups = []; score = 0; lives = 3; elapsed = 0; spawnTimer = 0.4; shake = 0;
+    stats = newStats();
     pack.x = pack.target = W / 2;
     document.getElementById("start").classList.add("hidden");
     document.getElementById("over").classList.add("hidden");
@@ -297,11 +299,34 @@
   // лучший результат за этот запуск игры — его и записываем в рейтинг
   let sessionBest = 0, sessionBestSecs = 0, gamesPlayed = 0;
 
+  // ---------- статистика для анализа (отправляется вместе с результатом) ----------
+  // Только считает события, на игру никак не влияет.
+  const pageOpenedAt = Date.now();
+  function newStats() {
+    return {
+      caught: 0, gold: 0, usedCaught: 0, missed: 0,
+      spawned: { stick: 0, gold: 0, used: 0 },
+      inputs: { touch: 0, drag: 0, mouse: 0, key: 0 },
+      startedAt: Date.now(),
+    };
+  }
+  let stats = newStats();
+  let sessionGames = [], bestGameDetail = null;
+
   function gameOver() {
     running = false;
     haptic("heavy");
     gamesPlayed += 1;
-    if (score > sessionBest) { sessionBest = score; sessionBestSecs = elapsed; }
+    const detail = {
+      score, secs: Math.round(elapsed * 10) / 10,
+      caught: stats.caught, gold: stats.gold, usedCaught: stats.usedCaught, missed: stats.missed,
+      spawned: stats.spawned, inputs: stats.inputs,
+      fallTimeEnd: Math.round(fallTime() * 100) / 100, spawnEveryEnd: Math.round(spawnEvery() * 100) / 100,
+      startedAt: stats.startedAt, endedAt: Date.now(),
+    };
+    sessionGames.push({ s: score, t: Math.round(elapsed) });
+    if (sessionGames.length > 30) sessionGames.shift();
+    if (score > sessionBest) { sessionBest = score; sessionBestSecs = elapsed; bestGameDetail = detail; }
     if (score > best) { best = score; saveBest(best); }
     document.getElementById("finalScore").textContent = score;
     document.getElementById("bestLine").textContent =
@@ -320,7 +345,18 @@
   function sendScore() {
     if (!inTelegram || sessionBest <= 0) return;
     try {
-      tg.sendData(JSON.stringify({ v: 1, best: sessionBest, secs: Math.round(sessionBestSecs), games: gamesPlayed }));
+      const payload = {
+        v: 2, best: sessionBest, secs: Math.round(sessionBestSecs), games: gamesPlayed,
+        detail: bestGameDetail, session: sessionGames,
+        device: {
+          platform: tg.platform, version: tg.version, w: W, h: H, dpr: DPR,
+          ua: (navigator.userAgent || "").slice(0, 160),
+        },
+        openSecs: Math.round((Date.now() - pageOpenedAt) / 1000),
+      };
+      let data = JSON.stringify(payload);
+      if (data.length > 4000) { payload.session = sessionGames.slice(-5); payload.device.ua = ""; data = JSON.stringify(payload); }
+      tg.sendData(data); // лимит Telegram — 4096 байт
     } catch (e) { // например, игру открыли не кнопкой внизу чата
       document.getElementById("saveHint").textContent =
         "Не получилось отправить. Откройте игру кнопкой «🎮 Игра» внизу чата с ботом.";
@@ -333,11 +369,13 @@
   // Мышь (компьютер): пачка просто следует за курсором.
   let drag = null;
   canvas.addEventListener("pointerdown", (e) => {
+    if (running) stats.inputs[e.pointerType === "mouse" ? "mouse" : "touch"] += 1;
     if (e.pointerType === "mouse") { pointerTo(e.clientX); return; }
     drag = { id: e.pointerId, startX: e.clientX, packX: pack.target };
     try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
   });
   canvas.addEventListener("pointermove", (e) => {
+    if (running) stats.inputs[e.pointerType === "mouse" ? "mouse" : "drag"] += 1;
     if (e.pointerType === "mouse") { pointerTo(e.clientX); return; }
     if (drag && e.pointerId === drag.id) pointerTo(drag.packX + (e.clientX - drag.startX) * 1.15);
   });
@@ -346,7 +384,10 @@
   canvas.addEventListener("pointercancel", endDrag);
   const keys = new Set();
   window.addEventListener("keydown", (e) => {
-    if (["ArrowLeft", "ArrowRight", "a", "d", "A", "D", "ф", "в"].includes(e.key)) { keys.add(e.key); e.preventDefault(); }
+    if (["ArrowLeft", "ArrowRight", "a", "d", "A", "D", "ф", "в"].includes(e.key)) {
+      if (running && !e.repeat) stats.inputs.key += 1;
+      keys.add(e.key); e.preventDefault();
+    }
     if ((e.key === " " || e.key === "Enter") && !running) start();
   });
   window.addEventListener("keyup", (e) => keys.delete(e.key));
@@ -376,16 +417,19 @@
           Math.abs(it.x - pack.x) <= pack.w / 2 + 4) {
         it.done = true;
         if (it.type === "used") {
+          stats.usedCaught += 1;
           lives -= 1; shake = 0.35; haptic("heavy");
           popup("−♥", it.x, pack.y - 10, "#ff6b6b");
         } else {
           const pts = it.type === "gold" ? 5 : 1;
+          if (it.type === "gold") stats.gold += 1; else stats.caught += 1;
           score += pts; pack.squash = 1; haptic(it.type === "gold" ? "medium" : "light");
           popup(`+${pts}`, it.x, pack.y - 10, it.type === "gold" ? "#f5c542" : "#ffffff");
         }
       } else if (it.y > H + 30) {
         it.done = true;
         if (it.type === "stick") {
+          stats.missed += 1;
           lives -= 1; shake = 0.25; haptic("rigid");
           popup("мимо!", it.x, H - 30, "#ff9b9b");
         }
